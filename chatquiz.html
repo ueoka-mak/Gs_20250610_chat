@@ -2,20 +2,20 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>チャット風ワード当てクイズ</title>
+  <title>AIチャット ワード当てクイズ</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <div class="chat-container">
-    <div class="chat-title">チャット風ワード当てクイズ</div>
+    <div class="chat-title">AIチャット ワード当てクイズ</div>
+    <div id="roomStatus"></div> 
     <div id="chat" class="chat-box"></div>
     <div class="input-area">
       <input type="text" id="userInput" placeholder="メッセージを入力..." autocomplete="off">
       <button id="sendBtn">送信</button>
       <button id="hintBtn">ヒント</button>
     </div>
-    <div id="scoreBoard"></div>
-    <div id="roomStatus"></div> 
+    <div id="participantsBoard"></div>
   </div>
 <script type="module" src="js/main.js"></script>
 </body>
