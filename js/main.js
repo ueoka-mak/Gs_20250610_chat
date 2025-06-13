@@ -1,7 +1,7 @@
 // main.js
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/9.20.0/firebase-app.js";
-import { getDatabase, ref, set, get, update, onValue } from "https://www.gstatic.com/firebasejs/9.20.0/firebase-database.js";
+import { getDatabase, ref, set, query, orderByChild, equalTo, get, update, onValue } from "https://www.gstatic.com/firebasejs/9.20.0/firebase-database.js";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/9.20.0/firebase-auth.js";
 
 // Lambdaの関数URL
@@ -182,18 +182,19 @@ async function createRoom(ownerName) {
 
 // ルーム参加
 async function joinRoom(roomId, userName) {
-  const newUserId = generateUserId();
-  
+  // const newUserId = generateUserId(); // ← これを削除
+  const newUserId = myUid; // Firebase認証のUIDを使う
+
   // participantsテーブルに名前を登録
   await update(ref(db, `rooms/${roomId}/participants`), { [newUserId]: userName });
-  
+
   // participantDataテーブルにUID情報を登録
   await set(ref(db, `rooms/${roomId}/participantData/${newUserId}`), {
-    uid: myUid,
+    uid: newUserId,
     name: userName,
     joinedAt: new Date().toISOString()
   });
-  
+
   // スコアテーブルにも初期値0で登録
   await set(ref(db, `scores/${roomId}/${newUserId}`), {
     name: userName,
@@ -276,8 +277,10 @@ function addAssistantMessage(text) {
 
 // 正解判定＆集計（修正版）
 function checkAndRecordCorrectAnswer(assistantText) {
-  if (!/正解/.test(assistantText)) return;
-
+  if (!/正解です！/.test(assistantText)) return;
+  // 否定語が含まれていたらreturn
+  if (/(不正解|残念|間違い)/.test(assistantText)) return;
+  
   // 現在の問題番号を特定
   let qNum = currentQuestion;
   if (/第1問/.test(assistantText) || /第一問/.test(assistantText)) {
@@ -290,32 +293,27 @@ function checkAndRecordCorrectAnswer(assistantText) {
 
   // 直前のユーザーメッセージを取得（最新のユーザーメッセージ）
   const lastUserMessage = [...messages].reverse().find(msg => msg.role === "user");
-  
+
   if (lastUserMessage && lastUserMessage.userId && lastUserMessage.messageId) {
+    // ここで userId を myUid に置き換える
     const answerKey = `${lastUserMessage.messageId}_q${qNum}`;
-    
-    // 既に処理済みかチェック
-    if (processedAnswers.has(answerKey)) {
-      console.log("Already processed answer:", answerKey);
-      return;
-    }
-    
-    // 処理済みとしてマーク
+
+    if (processedAnswers.has(answerKey)) return;
     processedAnswers.add(answerKey);
-    
+
     // Firebaseに正解記録
-    const resultRef = ref(db, `quiz_results/${roomId}/q${qNum}/${lastUserMessage.userId}`);
+    const resultRef = ref(db, `quiz_results/${roomId}/q${qNum}/${myUid}`);
     get(resultRef).then(snapshot => {
       if (!snapshot.exists()) {
         set(resultRef, {
-          userId: lastUserMessage.userId,
+          userId: myUid,
           userName: lastUserMessage.user,
           timestamp: lastUserMessage.timestamp,
           questionNumber: qNum,
           messageId: lastUserMessage.messageId
         }).then(() => {
           console.log("正解記録完了:", lastUserMessage.user, "問題", qNum);
-          updateScore(lastUserMessage.userId, lastUserMessage.user);
+          updateScore(myUid, lastUserMessage.user);
         });
       } else {
         console.log("Already recorded:", lastUserMessage.user, "問題", qNum);
@@ -326,6 +324,7 @@ function checkAndRecordCorrectAnswer(assistantText) {
 
 // スコア加点（修正版）
 function updateScore(targetUserId, targetUserName) {
+  console.log("スコア更新前 targetUserId:", targetUserId);
   const scoreRef = ref(db, `scores/${roomId}/${targetUserId}`);
   
   // トランザクション的な更新を行う
@@ -358,6 +357,7 @@ function subscribeChat() {
     const logs = snapshot.val() || [];
     chatBox.innerHTML = '';
     logs.forEach(msg => {
+      if (msg.role === "system") return; // AIの最初のクイズ出題メッセージは表示させない
       addMessage(msg.content, msg.role === "user" ? "user" : "ai", msg.user);
     });
     messages = logs;
@@ -420,20 +420,28 @@ function subscribeQuizEnd() {
       hintBtn.disabled = true;
       
       // 全参加者に対して結果画面を表示
-      showResult();
+      // showResult();
       
       // 5秒後にルーム選択画面に戻る
-      setTimeout(() => {
+      /*setTimeout(() => {
         console.log("ルーム選択画面に戻る");
         showRoomEntry();
-      }, 5000);
+      }, 5000); */
     }
   });
 }
 
 // 送信ボタン
-sendBtn.onclick = () => {
+sendBtn.onclick = async () => {
   if (quizEnded) return;
+  // ルームのisActiveをチェック
+  const roomRef = ref(db, `rooms/${roomId}`);
+  const snapshot = await get(roomRef);
+  if (!snapshot.exists() || snapshot.val().isActive === false) {
+    alert("クイズが終了されました。リロードします。");
+    location.reload();
+    return;
+  }
   const text = userInput.value.trim();
   if (!text) return;
   addUserMessage(text);
@@ -442,8 +450,16 @@ sendBtn.onclick = () => {
 };
 
 // ヒントボタン
-hintBtn.onclick = () => {
+hintBtn.onclick = async () => {
   if (quizEnded) return;
+  // ルームのisActiveをチェック
+  const roomRef = ref(db, `rooms/${roomId}`);
+  const snapshot = await get(roomRef);
+  if (!snapshot.exists() || snapshot.val().isActive === false) {
+    alert("クイズが終了されました。リロードします。");
+    location.reload();
+    return;
+  }
   addUserMessage("ヒント");
   sendToLambda();
 };
@@ -516,20 +532,65 @@ function showResult() {
 
 // クイズ開始
 function startQuiz() {
+  const statusText = isOwner ? "あなたはルームオーナー" : "ルームに復帰しました";
+  roomStatus.innerHTML = `
+    <div class="active-room-card">
+      <div class="active-room-info">
+        <span class="room-status">${statusText}</span>
+      </div>
+      <button id="resetRoomBtn" class="reset-room-btn">リセット</button>
+    </div>
+  `;
+  // リセットボタンのイベントリスナー
+  document.getElementById('resetRoomBtn').onclick = async () => {
+    if (confirm("本当にリセットしますか？")) {
+      // rooms/${roomId}/isActive を false に更新
+      await update(ref(db, `rooms/${roomId}`), { isActive: false });
+      document.getElementById('resetRoomBtn').style.display = 'none';
+      location.reload();
+    }
+  };
+
+  // 2. systemロールの指示文はmessages配列にだけ入れる（表示しない）
   if (!messages.length) {
     messages = [
       { role: "system", content: `
-あなたはLINE風チャットクイズの出題AIです。出題は必ず記述式（ワード当て）で行い、選択肢は絶対に出さないでください。最初から合計3問だけを連続で出題し、各問題のタイトルは必ず「【第1問】」「【第2問】」「【第3問】」のように何問目かを明記してください。1問ごとにユーザーの回答を受けて正誤判定とヒントを出し、3問終了後は自動的に「クイズ終了！」と表示してください。その後、参加者名と回答結果をもとに「いい勝負でしたね」「また参加してくださいね」などに簡単に総評を付け加えてコメントを必ず表示してください。追加の問題は出題しないでください。
-      `}
+あなたはLINE風チャットクイズの出題AIです。出題は必ず記述式（ワード当て）で行い、選択肢は絶対に出さないでください。最初から合計3問だけを連続で出題し、各問題のタイトルは必ず「【第1問】」「【第2問】」「【第3問】」のように何問目かを明記してください。
+
+【出題形式ルール】
+- 出題は「〇〇をカタカナで答えなさい」「〇〇を漢字で答えなさい」「〇〇の名前を答えなさい」など記述式にしてください。
+- 出題ジャンルは果物、人物、地名、動物、歴史上の出来事など幅広く構いません。
+- 各問題において、出題文・ヒント・正解のすべては実在の事実に基づき、互いに矛盾しないようにしてください。
+- 特に人物、歴史、作品、地名などの情報は、事実として確認できる内容のみを使用し、架空の情報や誤った情報、矛盾した情報を絶対に含めないでください。
+- 明らかに誤った生没年や代表作、出身地などを組み合わせた出題をしないでください。
+
+【ヒント・回答処理ルール】
+- ユーザーが「ヒント」と入力した場合、それは回答ではなくヒント要求とみなし、その問題に関する追加のヒントを1つだけ返してください。
+- ヒントは1問につき最大3回までとし、4回目以降に「ヒント」と入力された場合はその問題は打ち切りとし、正解を発表して次の問題に進んでください。
+- ユーザーが「ヒント」と入力しても、「ヒント は不正解です」などの判定は絶対に返さないでください。
+- ユーザーが「ヒント」以外のテキストを入力した場合、それは「回答」とみなし、正誤判定を行ってください。
+  - 正解の場合は「正解です！」と伝え、すぐに次の問題へ進んでください。
+  - 不正解の場合は「不正解です。もう一度答えてください。」と伝えてください。ヒント希望の可能性もあるため、ヒントも促す文言を追加しても構いません。
+
+【ヒントの出し方】
+- 最初の出題文はとても難しくしてください。すぐに答えがわからないような情報にしてください（例：その果物の100gあたりの栄養素、ある人物の生没年や出身地のみ、など）。
+- ヒント1〜3は徐々に具体性を増すようにしてください。ヒント3ではかなり答えに近い情報を出してもかまいません。
+
+【終了処理】
+- 3問すべて出題し終えたら「クイズ終了！」と必ず表示し、最後にお別れのあいさつ文を入れて追加の問題は絶対に出題しないでください。
+        `}
     ];
     saveMessagesToFirebase();
   }
   
   currentQuestion = 1;
   processedAnswers.clear();
+  // 3. 「最初の問題」をAIに渡す（チャット欄には表示しない）
   addUserMessage("最初の問題");
   sendToLambda();
 }
+
+
 
 // ルーム入室・作成ダイアログ
 async function showRoomEntry() {
@@ -550,6 +611,7 @@ async function showRoomEntry() {
   if (scoresUnsubscribe) scoresUnsubscribe();
   if (quizEndUnsubscribe) quizEndUnsubscribe();
 
+
   // まず自分が既に参加中のルームがあるかチェック
   const myRoom = await findMyParticipatingRoom();
   if (myRoom) {
@@ -566,18 +628,28 @@ async function showRoomEntry() {
       subscribeParticipantsAndScores();
       subscribeQuizEnd();
       
-      const statusText = isOwner ? "あなたはルームオーナーです" : "ルームに復帰しました";
+      const statusText = isOwner ? "あなたはルームオーナー" : "ルームに復帰しました";
       roomStatus.innerHTML = `
         <div class="active-room-card">
           <div class="active-room-info">
             <span class="room-status">${statusText}</span>
           </div>
+          <button id="resetRoomBtn" class="reset-room-btn">リセット</button>
         </div>
       `;
       userInput.disabled = false;
       sendBtn.disabled = false;
       hintBtn.disabled = false;
       
+       // リセットボタンのイベントリスナー
+      document.getElementById('resetRoomBtn').onclick = async () => {
+        if (confirm("本当にリセットしますか？")) {
+          // rooms/${roomId}/isActive を false に更新
+          await update(ref(db, `rooms/${roomId}`), { isActive: false });
+          location.reload();
+        }
+      };
+
       // オーナーで初回の場合はクイズ開始
       if (isOwner && !messages.length) startQuiz();
     });
@@ -624,6 +696,16 @@ async function showRoomEntry() {
     `;
     document.getElementById('startQuizBtn').onclick = () => {
       showNameDialog(async (name) => {
+        // 参加直前にも進行中のルームがないか再チェック（複数ルームが同時に作成されないよう制御）
+        const roomsRef = ref(db, "rooms");
+        const q = query(roomsRef, orderByChild("isActive"), equalTo(true));
+        const latestSnapshot = await get(q);
+        if (latestSnapshot.exists()) {
+          alert("他のユーザーが先にクイズを開始しました。ページをリロードしてください。");
+          location.reload();
+          return;
+        }
+
         displayName = name;
         userId = generateUserId();
         roomId = await createRoom(name);
@@ -646,9 +728,12 @@ async function showRoomEntry() {
 // Firebase匿名認証
 onAuthStateChanged(auth, (user) => {
   if (user) {
+    console.log("Already login:", user);
     myUid = user.uid;
+    console.log("myUid:", myUid);
     showRoomEntry();
   } else {
+    console.log("Login start:", user);
     signInAnonymously(auth);
   }
 });
